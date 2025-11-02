@@ -4,7 +4,7 @@ package.name = httpfileshare
 package.domain = com.example
 source.dir = .
 source.include_exts = py,kv,txt,ini
-version = 0.0.1
+version = 0.0.2
 
 requirements = python3,kivy
 orientation = portrait
