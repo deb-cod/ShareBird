@@ -1,13 +1,14 @@
 # main.py
-import os, socket, base64, threading
+import os, socket, base64, threading, traceback
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+from kivy.factory import Factory
 
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.properties import StringProperty, BooleanProperty
 from kivy.uix.popup import Popup
-from kivy.uix.boxlayout import BoxLayout
 from kivy.utils import platform
 
 ANDROID = (platform == "android")
@@ -16,6 +17,40 @@ if ANDROID:
     from jnius import autoclass
     from android import mActivity
 
+# ---------- Permissions / helpers ----------
+def has_all_files_access() -> bool:
+    if not ANDROID:
+        return True
+    try:
+        Build_VERSION = autoclass('android.os.Build$VERSION')
+        sdk = int(Build_VERSION.SDK_INT)
+        if sdk >= 30:
+            Environment = autoclass('android.os.Environment')
+            return bool(Environment.isExternalStorageManager())
+        return True
+    except Exception:
+        # Don't hard-fail: treat as allowed and rely on listdir test later.
+        return True
+
+def open_all_files_settings():
+    if not ANDROID:
+        return
+    try:
+        Intent = autoclass('android.content.Intent')
+        Settings = autoclass('android.provider.Settings')
+        Uri = autoclass('android.net.Uri')
+        intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+        intent.setData(Uri.parse(f"package:{mActivity.getPackageName()}"))
+        mActivity.startActivity(intent)
+    except Exception:
+        try:
+            Intent = autoclass('android.content.Intent')
+            Settings = autoclass('android.provider.Settings')
+            intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+            mActivity.startActivity(intent)
+        except Exception:
+            pass
+
 def ensure_storage_permission() -> bool:
     if not ANDROID:
         return True
@@ -23,39 +58,55 @@ def ensure_storage_permission() -> bool:
         request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
     except Exception:
         pass
-    try:
-        Build = autoclass('android.os.Build')
-        if Build.VERSION.SDK_INT >= 30:
-            Environment = autoclass('android.os.Environment')
-            if not Environment.isExternalStorageManager():
-                Intent = autoclass('android.content.Intent')
-                Settings = autoclass('android.provider.Settings')
-                Uri = autoclass('android.net.Uri')
-                intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
-                intent.setData(Uri.parse(f"package:{mActivity.getPackageName()}"))
-                mActivity.startActivity(intent)
-                return False
-    except Exception:
-        pass
-    return True
+    return has_all_files_access()
 
+# ---------- UI (safe folder picker) ----------
 KV = r"""
 #:import Clipboard kivy.core.clipboard.Clipboard
 #:import dp kivy.metrics.dp
 
-<FilePickerPopup>:
-    title: "Pick a folder"
-    size_hint: 0.9, 0.9
+<SafeFolderPicker@Popup>:
+    title: "Choose a folder"
+    size_hint: 0.9, None
+    height: dp(360)
     auto_dismiss: False
     BoxLayout:
         orientation: "vertical"
         spacing: dp(8)
-        padding: dp(8)
-        FileChooserListView:
-            id: chooser
-            dirselect: True
-            path: app.folder_path
-            filters: []
+        padding: dp(10)
+        GridLayout:
+            cols: 2
+            spacing: dp(8)
+            size_hint_y: None
+            height: dp(200)
+            Button:
+                text: "/sdcard/Download"
+                on_release: app.pick_quick("/sdcard/Download"); root.dismiss()
+            Button:
+                text: "/sdcard/Pictures"
+                on_release: app.pick_quick("/sdcard/Pictures"); root.dismiss()
+            Button:
+                text: "/sdcard/DCIM"
+                on_release: app.pick_quick("/sdcard/DCIM"); root.dismiss()
+            Button:
+                text: "/sdcard/Movies"
+                on_release: app.pick_quick("/sdcard/Movies"); root.dismiss()
+            Button:
+                text: "/sdcard/Music"
+                on_release: app.pick_quick("/sdcard/Music"); root.dismiss()
+            Button:
+                text: "/sdcard/Documents"
+                on_release: app.pick_quick("/sdcard/Documents"); root.dismiss()
+        Label:
+            text: "Or enter a custom path:"
+            size_hint_y: None
+            height: dp(20)
+        TextInput:
+            id: custom_path
+            multiline: False
+            text: app.folder_path
+            size_hint_y: None
+            height: dp(40)
         BoxLayout:
             size_hint_y: None
             height: dp(44)
@@ -64,8 +115,8 @@ KV = r"""
                 text: "Cancel"
                 on_release: root.dismiss()
             Button:
-                text: "Use this folder"
-                on_release: root.select_dir(chooser.path if chooser.path else chooser.current_path)
+                text: "Use this path"
+                on_release: app.pick_custom(custom_path.text); root.dismiss()
 
 BoxLayout:
     orientation: "vertical"
@@ -73,7 +124,7 @@ BoxLayout:
     spacing: 10
 
     Label:
-        text: "HTTP File Share (Kivy)"
+        text: "ShareBird (Kivy) — HTTP File Share"
         size_hint_y: None
         height: self.texture_size[1] + dp(6)
 
@@ -140,6 +191,22 @@ BoxLayout:
             on_release: app.stop_server()
 
     Label:
+        text: "Diagnostics"
+        size_hint_y: None
+        height: self.texture_size[1] + dp(6)
+
+    BoxLayout:
+        size_hint_y: None
+        height: dp(44)
+        spacing: 8
+        Button:
+            text: "Open All-files settings"
+            on_release: app.open_all_files()
+        Button:
+            text: "Check access now"
+            on_release: app.check_access()
+
+    Label:
         text: "Share URL"
         size_hint_y: None
         height: self.texture_size[1] + dp(6)
@@ -158,16 +225,22 @@ BoxLayout:
             width: dp(100)
             on_release: Clipboard.copy(app.share_url)
 
-    Label:
-        id: statuslbl
-        text: app.status_text
+    ScrollView:
         size_hint_y: None
-        height: dp(60)
-        halign: "left"
-        valign: "top"
-        text_size: self.size
+        height: dp(150)
+        do_scroll_x: False
+        do_scroll_y: True
+        Label:
+            id: statuslbl
+            text: app.status_text
+            size_hint_y: None
+            height: self.texture_size[1]
+            halign: "left"
+            valign: "top"
+            text_size: self.width, None
 """
 
+# ---------- Networking ----------
 def get_lan_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -178,9 +251,12 @@ def get_lan_ip() -> str:
     except Exception:
         return socket.gethostbyname(socket.gethostname())
 
+# ---------- HTTP handler (with optional Basic Auth) ----------
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
 class AuthHandler(SimpleHTTPRequestHandler):
     served_directory = None
-    auth_token = None
+    auth_token = None  # base64("user:pass") or None
 
     def __init__(self, *args, directory=None, **kwargs):
         super().__init__(*args, directory=self.served_directory or directory, **kwargs)
@@ -213,6 +289,7 @@ class AuthHandler(SimpleHTTPRequestHandler):
             return self.send_error(404, "No permission to list directory")
 
     def log_message(self, fmt, *args):
+        # quiet
         pass
 
 class ServerThread:
@@ -242,12 +319,7 @@ class ServerThread:
             self.thread.join(timeout=1.0)
             self.thread = None
 
-class FilePickerPopup(Popup):
-    def select_dir(self, path):
-        if path:
-            App.get_running_app().folder_path = path
-        self.dismiss()
-
+# ---------- App ----------
 class ShareApp(App):
     folder_path = StringProperty("/storage/emulated/0/Download" if ANDROID
                                  else os.path.join(os.path.expanduser("~"), "Downloads"))
@@ -262,15 +334,56 @@ class ShareApp(App):
         ensure_storage_permission()
         return Builder.load_string(KV)
 
+    # Safe picker actions
     def open_picker(self):
-        FilePickerPopup().open()
+        # instantiate the KV rule class
+        Factory.SafeFolderPicker().open()
+
+    def pick_quick(self, path):
+        self.folder_path = path
+        self.status_text = f"Selected: {path}"
+
+    def pick_custom(self, path):
+        path = (path or "").strip()
+        if not path:
+            self.status_text = "No path entered."
+            return
+        self.folder_path = path
+        self.status_text = f"Selected: {path}"
+
+    def open_all_files(self):
+        open_all_files_settings()
+
+    def check_access(self):
+        msgs = []
+        try:
+            msgs.append(f"Android: {ANDROID}")
+            if ANDROID:
+                Build_VERSION = autoclass('android.os.Build$VERSION')
+                sdk = int(Build_VERSION.SDK_INT)
+                msgs.append(f"SDK: {sdk}")
+                msgs.append(f"All-files access: {has_all_files_access()}")
+        except Exception as e:
+            msgs.append(f"SDK check err: {e}")
+
+        paths = [self.folder_path.strip()]
+        if paths[0].startswith("/storage/emulated/0"):
+            paths.append(paths[0].replace("/storage/emulated/0", "/sdcard", 1))
+
+        for p in paths:
+            try:
+                if not os.path.isdir(p):
+                    msgs.append(f"[X] Not a dir: {p}")
+                    continue
+                names = os.listdir(p)
+                preview = ", ".join(names[:10])
+                msgs.append(f"[✓] {p} -> {len(names)} entries")
+                msgs.append(f"    {preview}{' ...' if len(names) > 10 else ''}")
+            except Exception as e:
+                msgs.append(f"[!] listdir failed for {p}: {e}")
+        self.status_text = "\n".join(msgs)
 
     def start_server(self):
-        if not ensure_storage_permission() and ANDROID:
-            self.status_text = ("Please enable 'All files access' for this app, "
-                                "then return and press Start again.")
-            return
-
         directory = self.folder_path.strip()
         if ANDROID and directory.startswith("/storage/emulated/0"):
             alt = directory.replace("/storage/emulated/0", "/sdcard", 1)
@@ -279,6 +392,14 @@ class ShareApp(App):
 
         if not os.path.isdir(directory):
             self.status_text = f"Folder not found or no permission:\n{directory}"
+            return
+
+        try:
+            entries = os.listdir(directory)
+            self.status_text = f"Directory ok: {directory}  (entries: {len(entries)})"
+        except Exception as e:
+            self.status_text = (f"Cannot read this folder:\n{directory}\n{e}\n"
+                                "Tip: tap 'Open All-files settings' and enable the toggle.")
             return
 
         try:
@@ -304,8 +425,8 @@ class ShareApp(App):
         ip = get_lan_ip()
         self.share_url = f"http://{ip}:{port}/"
         self.running = True
-        self.status_text = (f"Serving:\n{directory}\n\nOpen on any device in same LAN:\n"
-                            f"{self.share_url}\n\nTip: keep screen awake for big transfers.")
+        self.status_text += (f"\n\nServing:\n{directory}\nOpen on same LAN:\n{self.share_url}\n"
+                             f"Tip: keep screen awake for big transfers.")
 
     def stop_server(self):
         try:
