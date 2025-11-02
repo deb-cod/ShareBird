@@ -30,6 +30,8 @@ To test:
 
 ```git clone https://github.com/deb-cod/ShareBird.git```
 
+
 ```pip install -r requirements.txt```
+
 
 ```python main.py```
