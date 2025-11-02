@@ -1,36 +1,81 @@
 # main.py
-import threading
-import socket
-import base64
-import os
+import os, socket, base64, threading
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from kivy.app import App
 from kivy.lang import Builder
 from kivy.properties import StringProperty, BooleanProperty
-from kivy.clock import mainthread
+from kivy.uix.popup import Popup
+from kivy.uix.boxlayout import BoxLayout
 from kivy.utils import platform
 
-# Optional permissions (Android)
-try:
-    if platform == "android":
-        from android.permissions import request_permissions, Permission
-except Exception:
-    pass
+ANDROID = (platform == "android")
+if ANDROID:
+    from android.permissions import request_permissions, Permission
+    from jnius import autoclass
+    from android import mActivity
+
+def ensure_storage_permission() -> bool:
+    if not ANDROID:
+        return True
+    try:
+        request_permissions([Permission.READ_EXTERNAL_STORAGE, Permission.WRITE_EXTERNAL_STORAGE])
+    except Exception:
+        pass
+    try:
+        Build = autoclass('android.os.Build')
+        if Build.VERSION.SDK_INT >= 30:
+            Environment = autoclass('android.os.Environment')
+            if not Environment.isExternalStorageManager():
+                Intent = autoclass('android.content.Intent')
+                Settings = autoclass('android.provider.Settings')
+                Uri = autoclass('android.net.Uri')
+                intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                intent.setData(Uri.parse(f"package:{mActivity.getPackageName()}"))
+                mActivity.startActivity(intent)
+                return False
+    except Exception:
+        pass
+    return True
 
 KV = r"""
 #:import Clipboard kivy.core.clipboard.Clipboard
+#:import dp kivy.metrics.dp
+
+<FilePickerPopup>:
+    title: "Pick a folder"
+    size_hint: 0.9, 0.9
+    auto_dismiss: False
+    BoxLayout:
+        orientation: "vertical"
+        spacing: dp(8)
+        padding: dp(8)
+        FileChooserListView:
+            id: chooser
+            dirselect: True
+            path: app.folder_path
+            filters: []
+        BoxLayout:
+            size_hint_y: None
+            height: dp(44)
+            spacing: dp(8)
+            Button:
+                text: "Cancel"
+                on_release: root.dismiss()
+            Button:
+                text: "Use this folder"
+                on_release: root.select_dir(chooser.path if chooser.path else chooser.current_path)
+
 BoxLayout:
     orientation: "vertical"
     padding: 12
     spacing: 10
 
     Label:
-        text: "Android HTTP File Share (Python/Kivy)"
+        text: "HTTP File Share (Kivy)"
         size_hint_y: None
         height: self.texture_size[1] + dp(6)
-        bold: True
 
     BoxLayout:
         size_hint_y: None
@@ -39,16 +84,16 @@ BoxLayout:
         Label:
             text: "Folder"
             size_hint_x: None
-            width: dp(80)
+            width: dp(60)
         TextInput:
             id: folder
             text: app.folder_path
             multiline: False
         Button:
-            text: "Use Download"
+            text: "Browse"
             size_hint_x: None
-            width: dp(130)
-            on_release: app.use_download()
+            width: dp(120)
+            on_release: app.open_picker()
 
     BoxLayout:
         size_hint_y: None
@@ -57,7 +102,7 @@ BoxLayout:
         Label:
             text: "Port"
             size_hint_x: None
-            width: dp(80)
+            width: dp(60)
         TextInput:
             id: port
             text: app.port_text
@@ -66,7 +111,7 @@ BoxLayout:
         Label:
             text: "User"
             size_hint_x: None
-            width: dp(60)
+            width: dp(50)
         TextInput:
             id: user
             text: app.user_text
@@ -74,7 +119,7 @@ BoxLayout:
         Label:
             text: "Pass"
             size_hint_x: None
-            width: dp(60)
+            width: dp(50)
         TextInput:
             id: pwd
             text: app.pass_text
@@ -86,21 +131,18 @@ BoxLayout:
         height: dp(44)
         spacing: 8
         Button:
-            id: startbtn
             text: "Start Server"
-            on_release: app.start_server()
             disabled: app.running
+            on_release: app.start_server()
         Button:
-            id: stopbtn
             text: "Stop"
-            on_release: app.stop_server()
             disabled: not app.running
+            on_release: app.stop_server()
 
     Label:
         text: "Share URL"
         size_hint_y: None
         height: self.texture_size[1] + dp(6)
-        bold: True
 
     BoxLayout:
         size_hint_y: None
@@ -114,10 +156,10 @@ BoxLayout:
             text: "Copy"
             size_hint_x: None
             width: dp(100)
-            on_release:
-                Clipboard.copy(app.share_url)
+            on_release: Clipboard.copy(app.share_url)
 
     Label:
+        id: statuslbl
         text: app.status_text
         size_hint_y: None
         height: dp(60)
@@ -126,7 +168,6 @@ BoxLayout:
         text_size: self.size
 """
 
-# ---------------- networking helpers ----------------
 def get_lan_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -137,10 +178,9 @@ def get_lan_ip() -> str:
     except Exception:
         return socket.gethostbyname(socket.gethostname())
 
-# --------------- HTTP handler with Basic Auth ----------
 class AuthHandler(SimpleHTTPRequestHandler):
     served_directory = None
-    auth_token = None  # "user:pass" in base64, or None (no auth)
+    auth_token = None
 
     def __init__(self, *args, directory=None, **kwargs):
         super().__init__(*args, directory=self.served_directory or directory, **kwargs)
@@ -158,39 +198,36 @@ class AuthHandler(SimpleHTTPRequestHandler):
 
     def do_HEAD(self):
         if not self._authed():
-            self._ask()
-            return
+            self._ask(); return
         super().do_HEAD()
 
     def do_GET(self):
         if not self._authed():
-            self._ask()
-            return
+            self._ask(); return
         super().do_GET()
 
+    def list_directory(self, path):
+        try:
+            return super().list_directory(path)
+        except Exception:
+            return self.send_error(404, "No permission to list directory")
+
     def log_message(self, fmt, *args):
-        # quiet logs; comment next line to see requests in logcat
         pass
 
 class ServerThread:
     def __init__(self, host, port, directory, user=None, pwd=None):
-        self.host = host
-        self.port = port
-        self.directory = directory
-        self.user = user
-        self.pwd = pwd
-        self.httpd = None
-        self.thread = None
+        self.host = host; self.port = port; self.directory = directory
+        self.user = user; self.pwd = pwd
+        self.httpd = None; self.thread = None
 
     def start(self):
-        # configure handler
         AuthHandler.served_directory = self.directory
         if self.user and self.pwd:
             token = base64.b64encode(f"{self.user}:{self.pwd}".encode()).decode()
             AuthHandler.auth_token = token
         else:
             AuthHandler.auth_token = None
-
         Handler = partial(AuthHandler, directory=self.directory)
         self.httpd = ThreadingHTTPServer((self.host, self.port), Handler)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -205,82 +242,79 @@ class ServerThread:
             self.thread.join(timeout=1.0)
             self.thread = None
 
-# ------------------- Kivy App -------------------------
+class FilePickerPopup(Popup):
+    def select_dir(self, path):
+        if path:
+            App.get_running_app().folder_path = path
+        self.dismiss()
+
 class ShareApp(App):
-    folder_path = StringProperty("/storage/emulated/0/Download")
-    # folder_path = StringProperty(r"E:\ShareBird\bin")
-    port_text = StringProperty("8000")
-    user_text = StringProperty("")
-    pass_text = StringProperty("")
-    share_url = StringProperty("—")
-    status_text = StringProperty("Pick a folder and press Start.")
-    running = BooleanProperty(False)
+    folder_path = StringProperty("/storage/emulated/0/Download" if ANDROID
+                                 else os.path.join(os.path.expanduser("~"), "Downloads"))
+    port_text  = StringProperty("8000")
+    user_text  = StringProperty("")
+    pass_text  = StringProperty("")
+    share_url  = StringProperty("—")
+    status_text= StringProperty("Pick a folder and press Start.")
+    running    = BooleanProperty(False)
 
     def build(self):
-        # Ask permissions on Android
-        if platform == "android":
-            try:
-                request_permissions([
-                    Permission.READ_EXTERNAL_STORAGE,
-                    Permission.WRITE_EXTERNAL_STORAGE,
-                    # On Android 11+ you may need this for full access:
-                    Permission.MANAGE_EXTERNAL_STORAGE,
-                ])
-            except Exception:
-                pass
+        ensure_storage_permission()
         return Builder.load_string(KV)
 
-    def use_download(self):
-        self.folder_path = "/storage/emulated/0/Download"
-
-    @mainthread
-    def _set_status(self, msg):
-        self.status_text = msg
+    def open_picker(self):
+        FilePickerPopup().open()
 
     def start_server(self):
-        # validate dir
-        directory = self.folder_path.strip()
-        if not os.path.isdir(directory):
-            self._set_status(f"Folder not found:\n{directory}")
+        if not ensure_storage_permission() and ANDROID:
+            self.status_text = ("Please enable 'All files access' for this app, "
+                                "then return and press Start again.")
             return
 
-        # validate port
+        directory = self.folder_path.strip()
+        if ANDROID and directory.startswith("/storage/emulated/0"):
+            alt = directory.replace("/storage/emulated/0", "/sdcard", 1)
+            if os.path.isdir(alt):
+                directory = alt
+
+        if not os.path.isdir(directory):
+            self.status_text = f"Folder not found or no permission:\n{directory}"
+            return
+
         try:
             port = int(self.port_text)
-            if not (1 <= port <= 65535):
-                raise ValueError()
+            if not (1 <= port <= 65535): raise ValueError()
         except Exception:
-            self._set_status("Invalid port. Use 1–65535 (e.g., 8000).")
+            self.status_text = "Invalid port. Use 1–65535 (e.g., 8000)."
             return
 
-        # spin server
         self._server = ServerThread(
             host="0.0.0.0",
             port=port,
             directory=directory,
-            user=self.user_text.strip() or None,
-            pwd=self.pass_text.strip() or None,
+            user=(self.user_text.strip() or None),
+            pwd=(self.pass_text.strip() or None),
         )
         try:
             self._server.start()
         except OSError as e:
-            self._set_status(f"Could not start (port in use or blocked):\n{e}")
+            self.status_text = f"Could not start (port in use or blocked):\n{e}"
             return
 
         ip = get_lan_ip()
         self.share_url = f"http://{ip}:{port}/"
         self.running = True
-        self._set_status(f"Serving:\n{directory}\n\nOpen this on your PC/phone:\n{self.share_url}\n\n"
-                         f"Tip: keep screen awake for big transfers.")
+        self.status_text = (f"Serving:\n{directory}\n\nOpen on any device in same LAN:\n"
+                            f"{self.share_url}\n\nTip: keep screen awake for big transfers.")
 
     def stop_server(self):
         try:
-            if hasattr(self, "_server") and self._server:
+            if getattr(self, "_server", None):
                 self._server.stop()
         finally:
             self.running = False
             self.share_url = "—"
-            self._set_status("Stopped.")
+            self.status_text = "Stopped."
             self._server = None
 
 if __name__ == "__main__":
